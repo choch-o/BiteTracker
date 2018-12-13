@@ -27,4 +27,7 @@ dependencies {
     androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
     wearApp project(':wear')
     implementation 'com.google.android.gms:play-services-wearable:+'
+    implementation files('libs/liblinear-1.94.jar')
+    implementation files('libs/libsvm.jar')
+    implementation files('libs/weka.jar')
 }

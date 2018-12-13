@@ -13,10 +13,13 @@ import android.hardware.SensorManager;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.PowerManager;
 import android.support.annotation.NonNull;
 import android.support.wearable.activity.WearableActivity;
 import android.util.Log;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 
@@ -30,6 +33,8 @@ import com.google.android.gms.wearable.CapabilityInfo;
 import com.google.android.gms.wearable.DataClient;
 import com.google.android.gms.wearable.DataItem;
 import com.google.android.gms.wearable.MessageApi;
+import com.google.android.gms.wearable.MessageClient;
+import com.google.android.gms.wearable.MessageEvent;
 import com.google.android.gms.wearable.Node;
 import com.google.android.gms.wearable.NodeApi;
 import com.google.android.gms.wearable.PutDataMapRequest;
@@ -48,25 +53,36 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
-import static java.security.AccessController.getContext;
 
-//public class MainActivity extends WearableActivity implements SensorEventListener {
-public class MainActivity extends WearableActivity {
+public class MainActivity extends WearableActivity implements SensorEventListener,
+        MessageClient.OnMessageReceivedListener {
+
+    int numFoods;
+
     private static final String TAG = "BiteTracker";
 
-    private TextView mTextView;
+    static int ACC_Z_THRESHOLD = -50;
+    // LEFT: X ++, Y -, Z --
+    static int LEFT_ACC_X_THRESHOLD = 70;      // x > t
+    static int LEFT_ACC_Y_THRESHOLD = -10;     // y < t
+    static int LEFT_ACC_Z_THRESHOLD = -40;     // z < t
 
-//    private SensorManager mSensorManager;
-//    private Sensor accelerometer;
-    private Sensor gyroscope;
-    private Sensor magnetometer;
-    LinearAccelerometer linearAccelerometer;
+    // CENTER: X ++, Y 0, Z -
+    static int CENTER_ACC_X_THRESHOLD = 70;     // x > t
+    static int CENTER_ACC_Y_THRESHOLD = 10;     // -t < y < t
+    static int CENTER_ACC_Z_THRESHOLD = -10;    // z < t
 
-    /* Using service */
-    private Button mStartTrackingBtn;
-    private Button mStopTrackingBtn;
+    // RIGHT: X ++, Y +, Z -
+    static int RIGHT_ACC_X_THRESHOLD = 70;       // x > t
+    static int RIGHT_ACC_Y_THRESHOLD = 30;       // y > t
+    static int RIGHT_ACC_Z_THRESHOLD = -40;      // z < t
 
-    boolean isTracking = false;
+    private static final int SENSOR_DELAY = 5000;      // in microseconds; 200 Hz
+    int TIME_DELAY = 3000; // ms
+
+    private TextView tvAcc;
+    private TextView tvGyro;
+    private TextView tvMag;
 
     byte[] sensorData;
 
@@ -89,16 +105,69 @@ public class MainActivity extends WearableActivity {
     /* For message client */
     private static final String SENSOR_PROCESSING_CAPABILITY_NAME = "sensor_processing";
     public static final String SENSOR_PROCESSING_MESSAGE_PATH = "/sensor_processing";
+    private static final String START_DATA_COLLECTION_NAME = "start_data_collection";
+    public static final String START_DATA_COLLECTION_PATH = "/start_data_collection";
+    private static final String STOP_DATA_COLLECTION_NAME = "stop_data_collection";
+    public static final String STOP_DATA_COLLECTION_PATH = "/stop_data_collection";
 
     String processingNodeId = null;
+
+    /* Acc and Gyro sensor */
+    SensorManager mSensorManager;
+    float[] lastAccValues = new float[3];
+    float[] lastGyroValues = new float[3];
+
+    static int SENSOR_WINDOW_SIZE = 100;
+
+
+    float sumAccX, sumAccY, sumAccZ;
+    float sumGyroX, sumGyroY, sumGyroZ;
+
+    long last_timestamp = 0;
+    long curr_timestamp = 0;
+    long time_interval = 0;
+    boolean initialized;
+    boolean isCollectingData = false;
+    ConnectTask connectTask;
+
+    boolean timeout = true;
+    Handler timerHandler = new Handler();
+    Runnable timerRunnable = new Runnable() {
+        @Override
+        public void run() {
+            timeout = true;
+            resetSumAcc();
+        }
+    };
+
+    int RESET_TIME = 500;   // ms
+
+    Handler resetHandler = new Handler();
+    Runnable resetRunnable = new Runnable() {
+        @Override
+        public void run() {
+            resetSumAcc();
+            resetHandler.postDelayed(this, RESET_TIME);
+        }
+    };
+
+    Button btReset;
+
+//    PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+//    PowerManager.WakeLock wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+//            "MyApp::MyWakelockTag");
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
         context = this;
-        mTextView = (TextView) findViewById(R.id.text);
+        tvAcc = (TextView) findViewById(R.id.tvAcc);
+        tvGyro = (TextView) findViewById(R.id.tvGyro);
+        tvMag = (TextView) findViewById(R.id.tvMag);
 
         // Enables Always-on
         setAmbientEnabled();
@@ -106,27 +175,9 @@ public class MainActivity extends WearableActivity {
         folder = new File(this.getExternalFilesDir(null)
                 + "/Files" + new Date().getTime());
 
-//        filenameAcc = folder.toString() + "/" + "Acc.csv";
-//        final String filenameGyro = folder.toString() + "/" + "Gyro.csv";
-//        final String filenameMag = folder.toString() + "/" + "Mag.csv";
-
-        /* Using service */
-        mStartTrackingBtn = (Button) findViewById(R.id.start_tracking);
-        mStartTrackingBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startTime = new Date().getTime();
-                isTracking = true;
-            }
-        });
-
-        mStopTrackingBtn = (Button) findViewById(R.id.stop_tracking);
-        mStopTrackingBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                isTracking = false;
-            }
-        });
+        filenameAcc = folder.toString() + "/" + "Acc.csv";
+        filenameGyro = folder.toString() + "/" + "Gyro.csv";
+        filenameMag = folder.toString() + "/" + "Mag.csv";
 
 
         if (!folder.exists())
@@ -134,45 +185,74 @@ public class MainActivity extends WearableActivity {
                 Log.d("BiteTracker","Directory created");
             }
 
-//        try {
-//            fwAcc = new FileWriter(filenameAcc);
-//            fwGyro = new FileWriter(filenameGyro);
-//            fwMag = new FileWriter(filenameMag);
-//        } catch (Exception e) {
-//            e.printStackTrace();
-//        }
+        try {
+            fwAcc = new FileWriter(filenameAcc);
+            fwGyro = new FileWriter(filenameGyro);
+            fwMag = new FileWriter(filenameMag);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
 
-        linearAccelerometer = new LinearAccelerometer();
+//        linearAccelerometer = new LinearAccelerometer();
 
-        ConnectTask connectTask = new ConnectTask();
+        mSensorManager = (SensorManager) this.getSystemService(Context.SENSOR_SERVICE);
+
+
+        connectTask = new ConnectTask();
         connectTask.execute();
 
         mDataClient = Wearable.getDataClient(context);
+
+        sumAccX = 0;
+        sumAccY = 0;
+        sumAccZ = 0;
+
+        btReset = (Button) findViewById(R.id.btReset);
+        btReset.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                resetSumAcc();
+            }
+        });
+
+        resetHandler.postDelayed(resetRunnable, RESET_TIME);
+        numFoods = 0;
+    }
+
+    void resetSumAcc() {
+        sumAccX = 0;
+        sumAccY = 0;
+        sumAccZ = 0;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        linearAccelerometer.registerListener();
+//        wakeLock.acquire();
+        mSensorManager.registerListener(this, mSensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION), SENSOR_DELAY);
+        mSensorManager.registerListener(this, mSensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE), SENSOR_DELAY);
+        mSensorManager.registerListener(this, mSensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD), SENSOR_DELAY);
+        Wearable.getMessageClient(context).addListener(this);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        linearAccelerometer.unregisterListener();
+        mSensorManager.unregisterListener(this);
+        Wearable.getMessageClient(context).removeListener(this);
+//        wakeLock.release();
     }
 
-    private class SendSensorValueTask extends AsyncTask<Void, String, Boolean> {
-
-        SendSensorValueTask() {
-
+    @Override
+    protected void onDestroy() {
+        try {
+            fwAcc.close();
+            fwGyro.close();
+            fwMag.close();
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-
-        @Override
-        protected Boolean doInBackground(Void... params) {
-
-            return false;
-        }
+        super.onDestroy();
     }
 
     private class ConnectTask extends AsyncTask<Void, Void, Boolean> {
@@ -197,7 +277,7 @@ public class MainActivity extends WearableActivity {
                 Log.d(TAG, "isSuccess, processingNodeId: " + processingNodeId);
             }
             else{
-
+                Log.d(TAG, "no success");
             }
         }
 
@@ -254,31 +334,10 @@ public class MainActivity extends WearableActivity {
         }
     }
 
-    void writeToFile(int sensorType, float x, float y, float z) {
-        try {
-            packetNum = (new Date().getTime() - startTime) / 10;
-            row = String.valueOf(packetNum) + "," + x + "," + y + "," + z + "\n";
-            switch (sensorType) {
-                case Sensor.TYPE_ACCELEROMETER:
-                    fwAcc.append(row);
-                    break;
-                case Sensor.TYPE_GYROSCOPE:
-                    fwGyro.append(row);
-                    break;
-                case Sensor.TYPE_MAGNETIC_FIELD:
-                    fwMag.append(row);
-                    break;
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-    }
-
-    private void requestSensorProcessing(byte[] sensorData) {
+    private void requestSendResult(byte[] resultData) {
         if (processingNodeId != null) {
             Task<Integer> sendTask = Wearable.getMessageClient(context).sendMessage(
-                    processingNodeId, SENSOR_PROCESSING_MESSAGE_PATH, sensorData);
+                    processingNodeId, SENSOR_PROCESSING_MESSAGE_PATH, resultData);
             sendTask.addOnSuccessListener(new OnSuccessListener<Integer>() {
                 @Override
                 public void onSuccess(Integer integer) {
@@ -296,6 +355,159 @@ public class MainActivity extends WearableActivity {
         }
     }
 
+    @Override
+    public void onMessageReceived(@NonNull MessageEvent messageEvent) {
+        Log.d(TAG, "Message received");
+        if (messageEvent.getPath().equals(START_DATA_COLLECTION_PATH)) {
+            if (messageEvent.getData() != null) {
+                Log.d(TAG, "Start data collection: " + new String(messageEvent.getData()));
+                numFoods = Integer.parseInt(new String(messageEvent.getData()));
+                startDataCollection();
+            }
+        } else if (messageEvent.getPath().equals(STOP_DATA_COLLECTION_PATH)) {
+            if (messageEvent.getData() != null) {
+                Log.d(TAG, "Stop data collection");
+                stopDataCollection();
+            }
+        }
+    }
+
+    private void startDataCollection() {
+        isCollectingData = true;
+    }
+
+    private void stopDataCollection() {
+        isCollectingData = false;
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+
+    }
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        curr_timestamp = new Date().getTime();
+//            time_interval = curr_timestamp - last_timestamp;
+//
+//            writeToFile(event.sensor.getType(), event.values[0], event.values[1], event.values[2]);
+        if (isCollectingData) {
+            if (event.sensor.getType() == Sensor.TYPE_LINEAR_ACCELERATION) {
+                sumAccX += event.values[0];
+                sumAccY += event.values[1];
+                sumAccZ += event.values[2];
+                if (timeout) {
+                    // LEFT
+//                    if ((sumAccX > LEFT_ACC_X_THRESHOLD)
+//                            && (sumAccY < LEFT_ACC_Y_THRESHOLD)
+//                            && (sumAccZ < LEFT_ACC_Z_THRESHOLD)) {
+                    if (numFoods == 1) {
+                        if ((Math.abs(sumAccX) + Math.abs(sumAccY) + Math.abs(sumAccZ)) > 50) {
+                            Log.d("CENTER", "\nLIFT\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("\nCENTER\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            requestSendResult(("CENTER," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        }
+                    } else if (numFoods == 2) {
+                        if ((sumAccZ <= -10)) {
+                            Log.d("LEFT-RIGHT", "\nLEFT\n\n\nACC:\nx: "
+                                    + event.values[0] + "\ny: " + event.values[1]
+                                    + "\nz: " + event.values[2]
+                                    + "\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("LEFT\n\n\nACC:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+                            requestSendResult(("LEFT," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        } else if ((sumAccZ >= 10)) {
+                            Log.d("LEFT-RIGHT", "\nRIGHT\n\n\nACC:\nx: "
+                                    + event.values[0] + "\ny: " + event.values[1]
+                                    + "\nz: " + event.values[2]
+                                    + "\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("RIGHT\n\n\nACC:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+                            requestSendResult(("RIGHT," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        }
+                    } else if (numFoods == 3) {
+                        if ((sumAccY < 20) && (sumAccZ <= -14)) {
+                            Log.d("LEFT-C-RIGHT", "\nLEFT\n\n\nACC:\nx: "
+                                    + event.values[0] + "\ny: " + event.values[1]
+                                    + "\nz: " + event.values[2]
+                                    + "\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("LEFT\n\n\nACC:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+                            requestSendResult(("LEFT," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        } // RIGHT
+//                    else if ((sumAccX > RIGHT_ACC_X_THRESHOLD)
+//                            && (sumAccY > RIGHT_ACC_Y_THRESHOLD)
+//                            && (sumAccZ < RIGHT_ACC_Z_THRESHOLD)) {
+                        else if (sumAccZ >= 14) {
+                            Log.d("LEFT-C-RIGHT", "\nRIGHT\n\n\nACC:\nx: "
+                                    + event.values[0] + "\ny: " + event.values[1]
+                                    + "\nz: " + event.values[2]
+                                    + "\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("RIGHT\n\n\nACC:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+                            requestSendResult(("RIGHT," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        } // CENTER
+//                    else if ((sumAccX > CENTER_ACC_X_THRESHOLD)
+//                            && ((sumAccY < CENTER_ACC_Y_THRESHOLD) && (sumAccY > -CENTER_ACC_Y_THRESHOLD))
+//                            && ((sumAccZ < CENTER_ACC_Z_THRESHOLD))) {
+                        else if ((sumAccX < -14)
+                                && ((sumAccZ < 14) && (sumAccZ > -14))) {
+                            Log.d("LEFT-C-RIGHT", "\nCENTER\n\n\nACC:\nx: "
+                                    + event.values[0] + "\ny: " + event.values[1]
+                                    + "\nz: " + event.values[2]
+                                    + "\n\n\n SUMACC: \nx: " + sumAccX
+                                    + "\ny: " + sumAccY
+                                    + "\nz: " + sumAccZ);
+                            tvAcc.setText("CENTER\n\n\nACC:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+                            requestSendResult(("CENTER," + curr_timestamp).getBytes());
+                            resetSumAcc();
+                            timeout = false;
+                            timerHandler.postDelayed(timerRunnable, TIME_DELAY);
+                        }
+                    }
+                }
+
+            } else if (event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+//                tvGyro.setText("GYRO:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+            } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+//                tvMag.setText("MAG:\nx: " + event.values[0] + "\ny: " + event.values[1] + "\nz: " + event.values[2]);
+            }
+        }
+//            try {
+//                if (isCollectingData) {
+//                    requestSensorProcessing((event.sensor.getStringType() + ","
+//                            + event.values[0] + "," + event.values[1] + ","
+//                            + event.values[2] + "," + curr_timestamp).getBytes());
+//                }
+//            } catch (Exception e) {
+//                e.printStackTrace();
+//            }
+    }
+
+    /*
     private class LinearAccelerometer implements SensorEventListener {
         final SensorManager mSensorManager;
         final Sensor mLinearAccelerometer;
@@ -322,6 +534,7 @@ public class MainActivity extends WearableActivity {
         }
 
         void registerListener() {
+//            mSensorManager.registerListener(this, mLinearAccelerometer, samplingRates);
             mSensorManager.registerListener(this, mLinearAccelerometer, SensorManager.SENSOR_DELAY_FASTEST);
         }
 
@@ -410,4 +623,5 @@ public class MainActivity extends WearableActivity {
 
         }
     }
+    */
 }
